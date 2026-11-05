@@ -83,7 +83,7 @@ try { ({ Wllama } = await import("./wllama/index.js")); window.__ace = true; }
 catch (e) { window.__ace = true; window.__aceFail("Engine files missing (wllama). Use the APK or the full zip from the build."); }
 
 const MODEL = "models/model.gguf";
-const SYS = "You are Ace AI, a helpful assistant. Be concise.";
+const SYS = "You are Ace AI. Reply in 1 to 3 short sentences.";
 let stage = "starting", wllama, history = [], busy = false, ready = false, queued = false, col;
 
 const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
@@ -171,17 +171,22 @@ async function getModelBlobs(m) {
   return [new Blob(parts)];
 }
 
-async function tryLoad(m) {
+const MT = typeof crossOriginIsolated !== "undefined" && crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+const NT = Math.max(2, Math.min(4, navigator.hardwareConcurrency || 4));
+const ATTEMPTS = [];   // best first: big model multi-core, big single-core, small multi-core, small single-core
+MODELS.forEach((m, i) => { if (MT) ATTEMPTS.push({ m: i, mt: true, id: i + "m" }); ATTEMPTS.push({ m: i, mt: false, id: i + "s" }); });
+
+async function tryLoad(att) {
+  const m = MODELS[att.m];
   stage = "preparing " + m.name;
   let blobs = await getModelBlobs(m);
   setLoader(99, "Starting the AI engine…");
-  stage = "loading " + m.name + " into memory";
+  stage = "loading " + m.name + (att.mt ? " (" + NT + " cores)" : " (1 core)") + " into memory";
   const u = p => new URL(p, location.href).href;
-  const w = new Wllama({
-    "single-thread/wllama.wasm": u("wllama/single-thread/wllama.wasm"),
-    "multi-thread/wllama.wasm": u("wllama/multi-thread/wllama.wasm")
-  }, { allowOffline: true });
-  try { await w.loadModel(blobs, { n_ctx: 512, n_batch: 32 }); }
+  const paths = { "single-thread/wllama.wasm": u("wllama/single-thread/wllama.wasm") };
+  if (att.mt) paths["multi-thread/wllama.wasm"] = u("wllama/multi-thread/wllama.wasm");
+  const w = new Wllama(paths, { allowOffline: true });
+  try { await w.loadModel(blobs, { n_ctx: 512, n_batch: 128, n_ubatch: 128, n_threads: att.mt ? NT : 1 }); }
   catch (e) { try { await w.exit(); } catch {} throw e; }
   blobs = null;
   return w;
@@ -191,31 +196,31 @@ async function boot() {
   try {
     if (!Wllama) return;
     if (typeof WebAssembly !== "object") throw new Error("WebAssembly is not supported on this phone");
-    let start = +ls.get("ace-idx") || 0;
-    const pending = ls.get("ace-try");               // set only if the last attempt never finished (hard crash)
-    if (pending !== null) start = Math.max(start, +pending + 1);
-    if (start >= MODELS.length) {                    // everything failed before: reset and report
-      ls.del("ace-idx"); ls.del("ace-try");
+    let start = Math.max(0, ATTEMPTS.findIndex(a => a.id === ls.get("ace-a")));
+    const pend = ls.get("ace-at");                   // set only if the last attempt never finished (hard crash)
+    if (pend !== null) { const pi = ATTEMPTS.findIndex(a => a.id === pend); if (pi >= 0) start = Math.max(start, pi + 1); }
+    if (start >= ATTEMPTS.length) {                  // everything failed before: reset and report
+      ls.del("ace-a"); ls.del("ace-at");
       throw new Error("Not enough free memory even for the smallest model. Close other apps, then reopen Ace AI");
     }
     let lastErr = null, used = -1;
-    for (let i = start; i < MODELS.length; i++) {
-      ls.set("ace-try", String(i));
+    for (let i = start; i < ATTEMPTS.length; i++) {
+      ls.set("ace-at", ATTEMPTS[i].id);
       try {
-        if (i > start) setLoader(0, "Low memory: trying a smaller model…");
-        wllama = await tryLoad(MODELS[i]); used = i; break;
-      } catch (e) { lastErr = e; console.warn(MODELS[i].name + " failed", e); }
+        if (i > start) setLoader(0, "Trying a lighter setup…");
+        wllama = await tryLoad(ATTEMPTS[i]); used = i; break;
+      } catch (e) { lastErr = e; console.warn(ATTEMPTS[i].id + " failed", e); }
     }
-    ls.del("ace-try");
+    ls.del("ace-at");
     if (used < 0) throw lastErr || new Error("No model could be loaded");
-    ls.set("ace-idx", String(used));
+    ls.set("ace-a", ATTEMPTS[used].id); usedAtt = ATTEMPTS[used];
     try {   // free storage: drop model copies we are not using
       const root = await navigator.storage.getDirectory();
-      for (let j = 0; j < MODELS.length; j++) if (j !== used) { try { await root.removeEntry(MODELS[j].store); } catch {} }
+      for (let j = 0; j < MODELS.length; j++) if (j !== usedAtt.m) { try { await root.removeEntry(MODELS[j].store); } catch {} }
     } catch {}
     ready = true;
     $("prog").style.display = "none"; $("loader").style.display = "none";
-    note.textContent = "Ready (" + MODELS[used].name + "). Running offline on your phone's CPU, replies can be slow";
+    note.textContent = "Ready (" + MODELS[usedAtt.m].name + ", " + (usedAtt.mt ? NT + " cores" : "1 core") + "). Running offline on your phone";
     const h = $("loadmsg"); if (h) h.textContent = "Ready";
     q.focus(); if (queued) generate();
   } catch (e) {
@@ -228,25 +233,47 @@ async function boot() {
 function buildPrompt() {
   const msgs = history.slice();
   const make = m => `<|im_start|>system\n${SYS}<|im_end|>\n` + m.map(x => `<|im_start|>${x.role}\n${x.content}<|im_end|>\n`).join("") + "<|im_start|>assistant\n";
-  while (make(msgs).length > 1000 && msgs.length > 2) msgs.splice(0, 2);
+  while (make(msgs).length > 700 && msgs.length > 2) msgs.splice(0, 2);
   return make(msgs);
+}
+
+let usedAtt = ATTEMPTS[0];
+async function recover() {
+  // The engine aborted: throw it away and reload the model from private storage (fast, no download)
+  try { await wllama.exit(); } catch {}
+  wllama = await tryLoad(usedAtt);
 }
 
 async function generate() {
   queued = false; busy = true; send.disabled = true;
-  const out = addRow("bot", "Thinking…"); let acc = ""; const dec = new TextDecoder();
-  try {
-    try { await wllama.kvClear(); } catch {}
-    await wllama.createCompletion(buildPrompt(), {
-      nPredict: 200,
-      sampling: { temp: 0.6, top_k: 40, top_p: 0.9 },
-      onNewToken: (t, piece) => {
-        acc += dec.decode(piece, { stream: true });
-        out.innerHTML = md(acc.replace(/<\|im_end\|>[\s\S]*/, "")); log.scrollTop = log.scrollHeight;
+  const out = addRow("bot", "Thinking…"); const dec = new TextDecoder();
+  const clean = t => t.replace(/<\|im_end\|>[\s\S]*/, "");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let acc = "", ntok = 0, t0 = performance.now();
+    try {
+      try { await wllama.kvClear(); } catch {}
+      await wllama.createCompletion(buildPrompt(), {
+        nPredict: 120,
+        useCache: false,
+        sampling: { temp: 0.6, top_k: 40, top_p: 0.9 },
+        onNewToken: (t, piece) => {
+          acc += dec.decode(piece, { stream: true }); ntok++;
+          out.innerHTML = md(clean(acc)); log.scrollTop = log.scrollHeight;
+        }
+      });
+      history.push({ role: "assistant", content: clean(acc) });
+      note.textContent = "Speed: " + (ntok / ((performance.now() - t0) / 1000)).toFixed(1) + " tokens/s";
+      break;
+    } catch (e) {
+      if (attempt === 0) {
+        out.textContent = "Restarting the AI engine…";
+        try { await recover(); } catch (e2) { out.textContent = "Error: " + (e2.message || e2); break; }
+      } else {
+        out.textContent = "Error: " + (e.message || e);
+        history.pop();   // drop the question that could not be answered
       }
-    });
-    history.push({ role: "assistant", content: acc.replace(/<\|im_end\|>[\s\S]*/, "") });
-  } catch (e) { out.textContent = "Error: " + (e.message || e); }
+    }
+  }
   busy = false; send.disabled = false;
 }
 
