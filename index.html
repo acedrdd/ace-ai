@@ -82,9 +82,9 @@ let Wllama;
 try { ({ Wllama } = await import("./wllama/index.js")); window.__ace = true; }
 catch (e) { window.__ace = true; window.__aceFail("Engine files missing (wllama). Use the APK or the full zip from the build."); }
 
-const MODEL = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+const MODEL = "models/model.gguf";
 const SYS = "You are Ace AI, a helpful assistant. Be concise.";
-let wllama, history = [], busy = false, ready = false, queued = false, col;
+let stage = "starting", wllama, history = [], busy = false, ready = false, queued = false, col;
 
 const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const md = s => esc(s)
@@ -113,7 +113,7 @@ async function boot() {
   try {
     if (!Wllama) return;
     if (typeof WebAssembly !== "object") throw new Error("WebAssembly is not supported on this phone");
-    let total = 0;
+    stage = "reading the model file"; let total = 0;
     try { total = (await (await fetch("models/model.json")).json()).bytes || 0; } catch {}
     const res = await fetch(MODEL);
     if (!res.ok) throw new Error("Model file not found inside the app (" + res.status + ")");
@@ -131,12 +131,12 @@ async function boot() {
     }
     if (batch.length) parts.push(new Blob(batch));
     setLoader(99, "Starting the AI engine…");
-    const u = p => new URL(p, location.href).href;
+    stage = "starting the AI engine"; const u = p => new URL(p, location.href).href;
     wllama = new Wllama({
       "single-thread/wllama.wasm": u("wllama/single-thread/wllama.wasm"),
       "multi-thread/wllama.wasm": u("wllama/multi-thread/wllama.wasm")
     }, { allowOffline: true });
-    await wllama.loadModel([new Blob(parts)], { n_ctx: 2048 });
+    stage = "loading the model into memory"; await wllama.loadModel([new Blob(parts)], { n_ctx: 1024, n_batch: 128 });
     ready = true;
     $("prog").style.display = "none"; $("loader").style.display = "none";
     note.textContent = "Ready. Running offline on your phone's CPU (replies can be slow)";
@@ -144,7 +144,7 @@ async function boot() {
     q.focus(); if (queued) generate();
   } catch (e) {
     $("prog").style.display = "none"; $("loader").style.display = "none";
-    const m = "Failed to start: " + (e.message || e);
+    const m = "Failed to start (" + stage + "): " + (e.message || e) + (/alloc|memory/i.test(String(e.message || e)) ? ". This phone ran out of memory. Close other apps and try again." : "");
     note.textContent = m; const h = $("loadmsg"); if (h) { h.textContent = m; h.style.color = "#d33"; }
   }
 }
@@ -152,7 +152,7 @@ async function boot() {
 function buildPrompt() {
   const msgs = history.slice();
   const make = m => `<|im_start|>system\n${SYS}<|im_end|>\n` + m.map(x => `<|im_start|>${x.role}\n${x.content}<|im_end|>\n`).join("") + "<|im_start|>assistant\n";
-  while (make(msgs).length > 3500 && msgs.length > 2) msgs.splice(0, 2);
+  while (make(msgs).length > 2000 && msgs.length > 2) msgs.splice(0, 2);
   return make(msgs);
 }
 
@@ -162,7 +162,7 @@ async function generate() {
   try {
     try { await wllama.kvClear(); } catch {}
     await wllama.createCompletion(buildPrompt(), {
-      nPredict: 256,
+      nPredict: 200,
       sampling: { temp: 0.6, top_k: 40, top_p: 0.9 },
       onNewToken: (t, piece) => {
         acc += dec.decode(piece, { stream: true });
