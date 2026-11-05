@@ -109,22 +109,30 @@ function setLoader(pct, text) {
   const h = $("loadmsg"); if (h) h.textContent = "Loading… " + pct + "% · " + text;
 }
 
-const MODEL_FILE = "model.gguf";
+const MODELS = [
+  { name: "SmolLM2 360M", url: "models/model.gguf", meta: "models/model.json", store: "model.gguf" },
+  { name: "SmolLM2 135M", url: "models/small.gguf", meta: "models/small.json", store: "small.gguf" }
+];
+const ls = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} }
+};
 
-// Copies the bundled model into the app's private storage ONCE (streamed in small
-// pieces, so RAM stays low) and returns a file-backed Blob. Later launches reuse it.
-async function getModelBlobs() {
+// Copies the bundled model into private storage ONCE (streamed, low RAM) and returns a
+// file-backed Blob. Later launches reuse it.
+async function getModelBlobs(m) {
   let total = 0;
-  try { total = (await (await fetch("models/model.json")).json()).bytes || 0; } catch {}
+  try { total = (await (await fetch(m.meta)).json()).bytes || 0; } catch {}
   let root = null;
   try { if (navigator.storage && navigator.storage.getDirectory) root = await navigator.storage.getDirectory(); } catch {}
   if (root) {
     try {
-      const fh = await root.getFileHandle(MODEL_FILE, { create: true });
+      const fh = await root.getFileHandle(m.store, { create: true });
       const have = await fh.getFile();
       if (total && have.size === total) { setLoader(99, "Model ready"); return [have]; }
-      stage = "copying the model (first launch only)";
-      const res = await fetch(MODEL);
+      stage = "copying " + m.name + " (first launch only)";
+      const res = await fetch(m.url);
       if (!res.ok) throw new Error("Model file not found inside the app (" + res.status + ")");
       total = total || +res.headers.get("content-length") || 0;
       const w = await fh.createWritable();
@@ -140,13 +148,12 @@ async function getModelBlobs() {
       await w.close();
       return [await fh.getFile()];
     } catch (e) {
-      try { await root.removeEntry(MODEL_FILE); } catch {}
-      console.warn("OPFS path failed, using fallback", e);
+      try { await root.removeEntry(m.store); } catch {}
+      console.warn("Private storage path failed, using fallback", e);
     }
   }
-  // Fallback for old WebViews without private file storage
-  stage = "reading the model file";
-  const res = await fetch(MODEL);
+  stage = "reading " + m.name;
+  const res = await fetch(m.url);
   if (!res.ok) throw new Error("Model file not found inside the app (" + res.status + ")");
   total = total || +res.headers.get("content-length") || 0;
   const reader = res.body.getReader();
@@ -164,29 +171,56 @@ async function getModelBlobs() {
   return [new Blob(parts)];
 }
 
+async function tryLoad(m) {
+  stage = "preparing " + m.name;
+  let blobs = await getModelBlobs(m);
+  setLoader(99, "Starting the AI engine…");
+  stage = "loading " + m.name + " into memory";
+  const u = p => new URL(p, location.href).href;
+  const w = new Wllama({
+    "single-thread/wllama.wasm": u("wllama/single-thread/wllama.wasm"),
+    "multi-thread/wllama.wasm": u("wllama/multi-thread/wllama.wasm")
+  }, { allowOffline: true });
+  try { await w.loadModel(blobs, { n_ctx: 512, n_batch: 32 }); }
+  catch (e) { try { await w.exit(); } catch {} throw e; }
+  blobs = null;
+  return w;
+}
+
 async function boot() {
   try {
     if (!Wllama) return;
     if (typeof WebAssembly !== "object") throw new Error("WebAssembly is not supported on this phone");
-    stage = "preparing the model";
-    let blobs = await getModelBlobs();
-    setLoader(99, "Starting the AI engine…");
-    stage = "starting the AI engine"; const u = p => new URL(p, location.href).href;
-    wllama = new Wllama({
-      "single-thread/wllama.wasm": u("wllama/single-thread/wllama.wasm"),
-      "multi-thread/wllama.wasm": u("wllama/multi-thread/wllama.wasm")
-    }, { allowOffline: true });
-    stage = "loading the model into memory";
-    await wllama.loadModel(blobs, { n_ctx: 768, n_batch: 64 });
-    blobs = null;
+    let start = +ls.get("ace-idx") || 0;
+    const pending = ls.get("ace-try");               // set only if the last attempt never finished (hard crash)
+    if (pending !== null) start = Math.max(start, +pending + 1);
+    if (start >= MODELS.length) {                    // everything failed before: reset and report
+      ls.del("ace-idx"); ls.del("ace-try");
+      throw new Error("Not enough free memory even for the smallest model. Close other apps, then reopen Ace AI");
+    }
+    let lastErr = null, used = -1;
+    for (let i = start; i < MODELS.length; i++) {
+      ls.set("ace-try", String(i));
+      try {
+        if (i > start) setLoader(0, "Low memory: trying a smaller model…");
+        wllama = await tryLoad(MODELS[i]); used = i; break;
+      } catch (e) { lastErr = e; console.warn(MODELS[i].name + " failed", e); }
+    }
+    ls.del("ace-try");
+    if (used < 0) throw lastErr || new Error("No model could be loaded");
+    ls.set("ace-idx", String(used));
+    try {   // free storage: drop model copies we are not using
+      const root = await navigator.storage.getDirectory();
+      for (let j = 0; j < MODELS.length; j++) if (j !== used) { try { await root.removeEntry(MODELS[j].store); } catch {} }
+    } catch {}
     ready = true;
     $("prog").style.display = "none"; $("loader").style.display = "none";
-    note.textContent = "Ready. Running offline on your phone's CPU (replies can be slow)";
+    note.textContent = "Ready (" + MODELS[used].name + "). Running offline on your phone's CPU, replies can be slow";
     const h = $("loadmsg"); if (h) h.textContent = "Ready";
     q.focus(); if (queued) generate();
   } catch (e) {
     $("prog").style.display = "none"; $("loader").style.display = "none";
-    const m = "Failed to start (" + stage + "): " + (e.message || e) + (/alloc|memory/i.test(String(e.message || e)) ? ". This phone ran out of memory. Close other apps and try again." : "");
+    const m = "Failed to start (" + stage + "): " + (e.message || e) + (/alloc|memory|abort/i.test(String(e.message || e)) ? ". This phone ran out of memory. Close other apps and try again." : "");
     note.textContent = m; const h = $("loadmsg"); if (h) { h.textContent = m; h.style.color = "#d33"; }
   }
 }
@@ -194,7 +228,7 @@ async function boot() {
 function buildPrompt() {
   const msgs = history.slice();
   const make = m => `<|im_start|>system\n${SYS}<|im_end|>\n` + m.map(x => `<|im_start|>${x.role}\n${x.content}<|im_end|>\n`).join("") + "<|im_start|>assistant\n";
-  while (make(msgs).length > 1600 && msgs.length > 2) msgs.splice(0, 2);
+  while (make(msgs).length > 1000 && msgs.length > 2) msgs.splice(0, 2);
   return make(msgs);
 }
 
