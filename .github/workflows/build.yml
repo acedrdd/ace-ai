@@ -6,8 +6,10 @@ on:
   workflow_dispatch:
 
 env:
-  # Small model = less RAM. If the app still closes, swap for a smaller one.
-  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  # Two models are bundled. The app tries the bigger one first and
+  # automatically falls back to the smaller one if the phone runs out of memory.
+  MODEL_URL: https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf
+  SMALL_MODEL_URL: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf
   WLLAMA_VERSION: 2.3.1
 
 jobs:
@@ -49,6 +51,8 @@ jobs:
         run: |
           curl -L --fail --retry 5 -o www/models/model.gguf "$MODEL_URL"
           echo "{\"bytes\": $(stat -c%s www/models/model.gguf)}" > www/models/model.json
+          curl -L --fail --retry 5 -o www/models/small.gguf "$SMALL_MODEL_URL"
+          echo "{\"bytes\": $(stat -c%s www/models/small.gguf)}" > www/models/small.json
           ls -lh www/models
 
       - name: Add Android and icons
