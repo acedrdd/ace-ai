@@ -6,8 +6,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Two models are bundled. The app tries the bigger one first and
-  # automatically falls back to the smaller one if the phone runs out of memory.
   MODEL_URL: https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q4_K_M.gguf
   SMALL_MODEL_URL: https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf
   WLLAMA_VERSION: 2.3.1
@@ -66,11 +64,8 @@ jobs:
         working-directory: app
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
-          # more heap for the app
           sed -i 's|<application|<application android:largeHeap="true" android:hardwareAccelerated="true"|' $MANIFEST
-          # keep activity alive on rotate/keyboard, lock portrait
           sed -i 's|<activity|<activity android:screenOrientation="portrait"|' $MANIFEST
-          # don't compress model/wasm (faster, less memory to read)
           cat >> android/app/build.gradle <<'EOF'
 
           android {
@@ -80,6 +75,49 @@ jobs:
           }
           EOF
           grep -n "largeHeap\|screenOrientation" $MANIFEST
+
+      - name: Enable multi-core AI (cross-origin isolation)
+        working-directory: app
+        run: |
+          mkdir -p android/app/src/main/java/com/aceai/app
+          cat > android/app/src/main/java/com/aceai/app/MainActivity.java <<'EOF'
+          package com.aceai.app;
+
+          import android.os.Bundle;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+          import com.getcapacitor.BridgeWebViewClient;
+          import java.util.HashMap;
+          import java.util.Map;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              final WebView wv = getBridge().getWebView();
+              wv.setWebViewClient(new BridgeWebViewClient(getBridge()) {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                  WebResourceResponse r = super.shouldInterceptRequest(view, request);
+                  if (r != null) {
+                    Map<String, String> h = new HashMap<>();
+                    if (r.getResponseHeaders() != null) h.putAll(r.getResponseHeaders());
+                    h.put("Cross-Origin-Opener-Policy", "same-origin");
+                    h.put("Cross-Origin-Embedder-Policy", "require-corp");
+                    h.put("Cross-Origin-Resource-Policy", "same-origin");
+                    r.setResponseHeaders(h);
+                  }
+                  return r;
+                }
+              });
+              String u = wv.getUrl();
+              if (u == null || u.isEmpty()) u = "https://localhost/";
+              wv.loadUrl(u);
+            }
+          }
+          EOF
 
       - name: Build APK
         working-directory: app/android
