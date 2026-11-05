@@ -46,13 +46,21 @@ jobs:
           test -f www/wllama/single-thread/wllama.wasm
 
       - name: Download the model into the app
+        env:
+          MODEL_REPO: HuggingFaceTB/SmolLM2-360M-Instruct-GGUF
+          MODEL_MATCH: q4_k_m.gguf
         run: |
           mkdir -p www/models
-          curl -L --fail --retry 5 --retry-delay 10 -o www/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-            https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
-          SIZE=$(stat -c %s www/models/qwen2.5-0.5b-instruct-q4_k_m.gguf)
+          FILE=$(curl -sL --retry 5 https://huggingface.co/api/models/$MODEL_REPO | python3 -c "import sys,json; m='$MODEL_MATCH'; f=[s['rfilename'] for s in json.load(sys.stdin)['siblings'] if s['rfilename'].lower().endswith(m)]; print(f[0])") || {
+            echo "Small model not found, using Qwen instead"
+            MODEL_REPO=Qwen/Qwen2.5-0.5B-Instruct-GGUF
+            FILE=qwen2.5-0.5b-instruct-q4_0.gguf
+          }
+          echo "model: $MODEL_REPO / $FILE"
+          curl -L --fail --retry 5 --retry-delay 10 -o www/models/model.gguf "https://huggingface.co/$MODEL_REPO/resolve/main/$FILE"
+          SIZE=$(stat -c %s www/models/model.gguf)
           echo "model bytes: $SIZE"
-          test "$SIZE" -gt 100000000
+          test "$SIZE" -gt 50000000
           echo "{\"bytes\": $SIZE}" > www/models/model.json
 
       - name: Wrap with Capacitor
