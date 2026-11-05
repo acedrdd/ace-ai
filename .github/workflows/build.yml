@@ -1,9 +1,14 @@
-name: Build Ace AI
+name: Build Ace AI APK
 
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+
+env:
+  # Small model = less RAM. If the app still closes, swap for a smaller one.
+  MODEL_URL: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+  WLLAMA_VERSION: 2.3.1
 
 jobs:
   build:
@@ -21,74 +26,65 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Find the app files
+      - name: Create app project
         run: |
-          mkdir -p www assets
-          for f in index.html logo.png; do
-            if [ -f $f ] && [ ! -f www/$f ]; then cp $f www/$f; fi
-          done
-          for f in icon-only.png icon-foreground.png icon-background.png splash.png splash-dark.png; do
-            if [ -f $f ] && [ ! -f assets/$f ]; then cp $f assets/$f; fi
-          done
-          test -f www/index.html || { echo "index.html not found. Upload it to the repo."; exit 1; }
-          ls www assets
-
-      - name: Install packages
-        run: |
+          mkdir -p app/www/models app/assets
+          cd app
           npm init -y
-          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @wllama/wllama@2 @capacitor/assets@3
-
-      - name: Add the CPU AI engine (works on phones without WebGPU)
-        run: |
-          ls node_modules/@wllama/wllama/esm
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @capacitor/assets@3 @wllama/wllama@${WLLAMA_VERSION}
+          cp ../index.html www/index.html
           cp -r node_modules/@wllama/wllama/esm www/wllama
-          test -f www/wllama/index.js
-          test -f www/wllama/single-thread/wllama.wasm
-
-      - name: Download the model into the app
-        env:
-          MODEL_REPO: HuggingFaceTB/SmolLM2-360M-Instruct-GGUF
-          MODEL_MATCH: q4_k_m.gguf
-        run: |
-          mkdir -p www/models
-          FILE=$(curl -sL --retry 5 https://huggingface.co/api/models/$MODEL_REPO | python3 -c "import sys,json; m='$MODEL_MATCH'; f=[s['rfilename'] for s in json.load(sys.stdin)['siblings'] if s['rfilename'].lower().endswith(m)]; print(f[0])") || {
-            echo "Small model not found, using Qwen instead"
-            MODEL_REPO=Qwen/Qwen2.5-0.5B-Instruct-GGUF
-            FILE=qwen2.5-0.5b-instruct-q4_0.gguf
+          cp ../icon-*.png ../splash*.png assets/
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.aceai.app",
+            "appName": "Ace AI",
+            "webDir": "www",
+            "server": { "androidScheme": "https" }
           }
-          echo "model: $MODEL_REPO / $FILE"
-          curl -L --fail --retry 5 --retry-delay 10 -o www/models/model.gguf "https://huggingface.co/$MODEL_REPO/resolve/main/$FILE"
-          SIZE=$(stat -c %s www/models/model.gguf)
-          echo "model bytes: $SIZE"
-          test "$SIZE" -gt 50000000
-          echo "{\"bytes\": $SIZE}" > www/models/model.json
+          EOF
 
-      - name: Wrap with Capacitor
+      - name: Download model
+        working-directory: app
         run: |
-          npx cap init "Ace AI" com.example.aceai --web-dir www
-          npx cap add android
-          npx capacitor-assets generate --android --iconBackgroundColor '#000000' --iconBackgroundColorDark '#000000' --splashBackgroundColor '#000000' --splashBackgroundColorDark '#000000' || echo "Icon generation failed, default icon used"
-          sed -i 's/^android {/android {\n    aaptOptions { noCompress "gguf", "wasm" }/' android/app/build.gradle
-          npx cap sync android
-          echo "org.gradle.jvmargs=-Xmx4g" >> android/gradle.properties
+          curl -L --fail --retry 5 -o www/models/model.gguf "$MODEL_URL"
+          echo "{\"bytes\": $(stat -c%s www/models/model.gguf)}" > www/models/model.json
+          ls -lh www/models
 
-      - name: Build debug APK
-        working-directory: android
+      - name: Add Android and icons
+        working-directory: app
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android
+          npx cap sync android
+
+      - name: Patch Android for low-memory phones
+        working-directory: app
+        run: |
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          # more heap for the app
+          sed -i 's|<application|<application android:largeHeap="true" android:hardwareAccelerated="true"|' $MANIFEST
+          # keep activity alive on rotate/keyboard, lock portrait
+          sed -i 's|<activity|<activity android:screenOrientation="portrait"|' $MANIFEST
+          # don't compress model/wasm (faster, less memory to read)
+          cat >> android/app/build.gradle <<'EOF'
+
+          android {
+              androidResources {
+                  noCompress 'gguf', 'wasm'
+              }
+          }
+          EOF
+          grep -n "largeHeap\|screenOrientation" $MANIFEST
+
+      - name: Build APK
+        working-directory: app/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug --no-daemon -Dorg.gradle.jvmargs="-Xmx3g"
 
-      - name: Zip the full offline web app
-        run: cd www && zip -qr ../ace-ai-full.zip .
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: ace-ai-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          compression-level: 0
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ace-ai-full-zip
-          path: ace-ai-full.zip
-          compression-level: 0
+          name: Ace-AI-apk
+          path: app/android/app/build/outputs/apk/debug/app-debug.apk
