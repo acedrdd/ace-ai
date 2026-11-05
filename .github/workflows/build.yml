@@ -1,0 +1,86 @@
+name: Build Ace AI
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Find the app files
+        run: |
+          mkdir -p www assets
+          for f in index.html logo.png; do
+            if [ -f $f ] && [ ! -f www/$f ]; then cp $f www/$f; fi
+          done
+          for f in icon-only.png icon-foreground.png icon-background.png splash.png splash-dark.png; do
+            if [ -f $f ] && [ ! -f assets/$f ]; then cp $f assets/$f; fi
+          done
+          test -f www/index.html || { echo "index.html not found. Upload it to the repo."; exit 1; }
+          ls www assets
+
+      - name: Install packages
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6 @wllama/wllama@2 @capacitor/assets@3
+
+      - name: Add the CPU AI engine (works on phones without WebGPU)
+        run: |
+          ls node_modules/@wllama/wllama/esm
+          cp -r node_modules/@wllama/wllama/esm www/wllama
+          test -f www/wllama/index.js
+          test -f www/wllama/single-thread/wllama.wasm
+
+      - name: Download the model into the app
+        run: |
+          mkdir -p www/models
+          curl -L --fail --retry 5 --retry-delay 10 -o www/models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+            https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+          SIZE=$(stat -c %s www/models/qwen2.5-0.5b-instruct-q4_k_m.gguf)
+          echo "model bytes: $SIZE"
+          test "$SIZE" -gt 100000000
+          echo "{\"bytes\": $SIZE}" > www/models/model.json
+
+      - name: Wrap with Capacitor
+        run: |
+          npx cap init "Ace AI" com.example.aceai --web-dir www
+          npx cap add android
+          npx capacitor-assets generate --android --iconBackgroundColor '#000000' --iconBackgroundColorDark '#000000' --splashBackgroundColor '#000000' --splashBackgroundColorDark '#000000' || echo "Icon generation failed, default icon used"
+          sed -i 's/^android {/android {\n    aaptOptions { noCompress "gguf", "wasm" }/' android/app/build.gradle
+          npx cap sync android
+          echo "org.gradle.jvmargs=-Xmx4g" >> android/gradle.properties
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Zip the full offline web app
+        run: cd www && zip -qr ../ace-ai-full.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ace-ai-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          compression-level: 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ace-ai-full-zip
+          path: ace-ai-full.zip
+          compression-level: 0
